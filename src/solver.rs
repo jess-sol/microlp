@@ -52,6 +52,11 @@ pub(crate) struct Solver {
     orig_constraints: CsMat, // excluding rhs
     orig_constraints_csc: CsMat,
     orig_rhs: Vec<f64>,
+    /// For each constraint added by the caller (in insertion order), the
+    /// corresponding row of `orig_constraints`, or `None` if the constraint
+    /// was dropped as a tautology (empty left-hand side). Internal
+    /// strengthening rows (Gomory cuts) are deliberately absent.
+    pub(crate) constraint_rows: Vec<Option<usize>>,
 
     enable_primal_steepest_edge: bool,
     enable_dual_steepest_edge: bool,
@@ -244,6 +249,7 @@ impl Solver {
 
         let mut constraint_coeffs = vec![];
         let mut orig_rhs = vec![];
+        let mut constraint_rows = vec![];
 
         // Initially, all slack vars are basic.
         let mut basic_vars = vec![];
@@ -262,12 +268,14 @@ impl Solver {
                 };
 
                 if is_tautological {
+                    constraint_rows.push(None);
                     continue;
                 } else {
                     return Err(Error::Infeasible);
                 }
             }
 
+            constraint_rows.push(Some(constraint_coeffs.len()));
             constraint_coeffs.push(coeffs.clone());
             orig_rhs.push(rhs);
 
@@ -383,6 +391,7 @@ impl Solver {
             orig_constraints,
             orig_constraints_csc,
             orig_rhs,
+            constraint_rows,
             deadline,
             orig_var_domains: var_domains.to_vec(),
             /*orig_int_vars: var_domains
@@ -527,6 +536,27 @@ impl Solver {
 
     pub(crate) fn num_constraints(&self) -> usize {
         self.orig_constraints.rows()
+    }
+
+    /// Dual multipliers of the current basis, one per row of
+    /// `orig_constraints`, in the internal minimization orientation:
+    /// y = Bᵀ⁻¹ c_B, so the reduced cost of a column `a` with objective
+    /// coefficient `c` is `c − yᵀa`. Refactorizes the basis first if
+    /// eta-file updates have accumulated (the same procedure
+    /// `recalc_obj_coeffs` uses).
+    pub(crate) fn dual_values(&mut self) -> Result<Vec<f64>, Error> {
+        if self.basis_solver.eta_matrices.len() > 0 {
+            self.basis_solver
+                .reset(&self.orig_constraints_csc, &self.basic_vars)?;
+        }
+        let mut rhs = vec![0.0; self.num_constraints()];
+        for (r, &var) in self.basic_vars.iter().enumerate() {
+            rhs[r] = self.orig_obj_coeffs[var];
+        }
+        self.basis_solver
+            .lu_factors_transp
+            .solve_dense(&mut rhs, &mut self.basis_solver.scratch);
+        Ok(rhs)
     }
 
     pub(crate) fn has_integer_vars(&self) -> bool {

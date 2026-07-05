@@ -563,6 +563,47 @@ impl Solution {
         }
     }
 
+    /// The dual value (shadow price) of each constraint, in the order the
+    /// constraints were added ([`Problem::add_constraint`] /
+    /// [`Solution::add_constraint`]).
+    ///
+    /// A constraint's dual value is the rate of change of the optimal objective
+    /// per unit increase of its right-hand side, valid while the current optimal
+    /// basis remains optimal. Equivalently, the duals certify optimality: for a
+    /// minimization problem, every candidate column `a` with objective
+    /// coefficient `c` and a nonnegative variable has reduced cost `c − yᵀa ≥ 0`
+    /// at an optimum. Signs follow the problem's optimization direction — for
+    /// minimization, binding [`ComparisonOp::Ge`] rows price ≥ 0 and binding
+    /// [`ComparisonOp::Le`] rows price ≤ 0; for maximization the reverse.
+    /// Non-binding rows and tautological (empty left-hand side) constraints
+    /// report 0.
+    ///
+    /// The values are extracted from the final simplex basis, so they are
+    /// meaningful for pure-LP problems solved to optimality
+    /// ([`StopReason::Finished`]). For problems with integer variables they are
+    /// the duals of the last LP relaxation solved, which is rarely useful.
+    ///
+    /// Takes `&mut self` because the basis may need a refactorization before
+    /// extraction (the same operation the solver performs periodically between
+    /// iterations); the solution itself is not changed.
+    ///
+    /// # Errors
+    ///
+    /// Will return an error if the basis refactorization fails.
+    pub fn dual_values(&mut self) -> Result<Vec<f64>, Error> {
+        let internal = self.solver.dual_values()?;
+        let sign = match self.direction {
+            OptimizationDirection::Minimize => 1.0,
+            OptimizationDirection::Maximize => -1.0,
+        };
+        Ok(self
+            .solver
+            .constraint_rows
+            .iter()
+            .map(|row| row.map_or(0.0, |r| sign * internal[r]))
+            .collect())
+    }
+
     /// Add another constraint and return the solution to the updated problem.
     ///
     /// This method will consume the solution and not return it in case of error. See also
@@ -581,12 +622,21 @@ impl Solution {
         rhs: f64,
     ) -> Result<Self, Error> {
         let expr = expr.into();
+        let rows_before = self.solver.num_constraints();
         let stop_reason = self.solver.add_constraint(
             CsVec::new_from_unsorted(self.num_vars, expr.vars, expr.coeffs)
                 .map_err(|v| Error::InternalError(v.2.to_string()))?,
             cmp_op,
             rhs,
         )?;
+        // Keep the caller-order → row map in step (a tautological constraint
+        // adds no row and reports a zero dual).
+        let rows_after = self.solver.num_constraints();
+        self.solver.constraint_rows.push(if rows_after > rows_before {
+            Some(rows_after - 1)
+        } else {
+            None
+        });
         self.stop_reason = stop_reason;
         Ok(self)
     }
