@@ -419,12 +419,67 @@ pub enum StopReason {
     Finished,
 }
 
+/// A batch of new variables and constraints to apply to a [`Solution`] in one warm
+/// re-solve (see [`Solution::update`] / [`Solution::apply`]).
+///
+/// The whole batch costs one matrix rebuild and at most one basis refactorization,
+/// however many variables and constraints it contains — prefer one `Update` over a
+/// sequence of single [`Solution::add_var`] / [`Solution::add_constraint`] calls when
+/// adding more than one thing.
+#[derive(Clone, Debug)]
+pub struct Update {
+    direction: OptimizationDirection,
+    num_existing_vars: usize,
+    num_existing_constraints: usize,
+    new_vars: Vec<(f64, (f64, f64))>,
+    new_var_coeffs: Vec<Vec<(usize, f64)>>,
+    new_constraints: Vec<(LinearExpr, ComparisonOp, f64)>,
+}
+
+impl Update {
+    /// Add a new variable to the batch and return its handle (valid on the solution
+    /// returned by [`Solution::apply`]; also usable immediately in this batch's
+    /// [`add_constraint`](#method.add_constraint) calls).
+    ///
+    /// `coeffs` lists the variable's coefficients in EXISTING constraints, identified by
+    /// insertion order (the order of `Problem::add_constraint` and warm
+    /// `add_constraint` calls); omitted constraints get coefficient zero. Coefficients
+    /// in NEW constraints are given on the constraint side.
+    pub fn add_var(
+        &mut self,
+        obj_coeff: f64,
+        (min, max): (f64, f64),
+        coeffs: &[(usize, f64)],
+    ) -> Variable {
+        let obj_coeff = match self.direction {
+            OptimizationDirection::Minimize => obj_coeff,
+            OptimizationDirection::Maximize => -obj_coeff,
+        };
+        for &(ci, _) in coeffs {
+            assert!(
+                ci < self.num_existing_constraints,
+                "constraint index {ci} out of range"
+            );
+        }
+        let var = Variable(self.num_existing_vars + self.new_vars.len());
+        self.new_vars.push((obj_coeff, (min, max)));
+        self.new_var_coeffs.push(coeffs.to_vec());
+        var
+    }
+
+    /// Add a new constraint to the batch. The left-hand side may reference existing
+    /// variables and variables added to this batch.
+    pub fn add_constraint(&mut self, expr: impl Into<LinearExpr>, cmp_op: ComparisonOp, rhs: f64) {
+        self.new_constraints.push((expr.into(), cmp_op, rhs));
+    }
+}
+
 /// A solution of a problem: optimal objective function value and variable values.
 ///
 /// Note that a `Solution` instance contains the whole solver machinery which can require
 /// a lot of memory for larger problems. Thus saving the `Solution` instance (as opposed
 /// to getting the values of interest and discarding the solution) is mainly useful if you
-/// want to add more constraints to it later.
+/// want to add more constraints or variables to it later.
 #[derive(Clone)]
 pub struct Solution {
     direction: OptimizationDirection,
@@ -602,6 +657,99 @@ impl Solution {
             .iter()
             .map(|row| row.map_or(0.0, |r| sign * internal[r]))
             .collect())
+    }
+
+    /// Start a batch of new variables and constraints against this solution; apply it
+    /// with [`apply`](#method.apply).
+    pub fn update(&self) -> Update {
+        Update {
+            direction: self.direction,
+            num_existing_vars: self.num_vars,
+            num_existing_constraints: self.solver.constraint_rows.len(),
+            new_vars: Vec::new(),
+            new_var_coeffs: Vec::new(),
+            new_constraints: Vec::new(),
+        }
+    }
+
+    /// Apply a batch of new variables and constraints and return the re-optimized
+    /// solution — warmly, from the stored basis: the whole batch costs one matrix
+    /// rebuild and at most one basis refactorization; if nothing in it can improve the
+    /// objective or violate feasibility, the re-solve is two pricing passes and zero
+    /// simplex pivots.
+    ///
+    /// This method will consume the solution and not return it in case of error.
+    ///
+    /// # Errors
+    ///
+    /// Will return an error if the problem becomes infeasible with the added
+    /// constraints, or in case of numerical problems.
+    ///
+    /// # Panics
+    ///
+    /// Will panic if `update` was created from a different solution (variable or
+    /// constraint counts diverge).
+    pub fn apply(mut self, update: Update) -> Result<Self, Error> {
+        assert_eq!(
+            update.num_existing_vars, self.num_vars,
+            "update built against a different solution"
+        );
+        assert_eq!(
+            update.num_existing_constraints,
+            self.solver.constraint_rows.len(),
+            "update built against a different solution"
+        );
+        let new_num_vars = self.num_vars + update.new_vars.len();
+
+        // Map caller constraint order → matrix rows (a tautological
+        // constraint occupies no row and takes no coefficients).
+        let mut var_row_coeffs: Vec<Vec<(usize, f64)>> =
+            Vec::with_capacity(update.new_var_coeffs.len());
+        for coeffs in &update.new_var_coeffs {
+            let mut by_row: Vec<(usize, f64)> = Vec::with_capacity(coeffs.len());
+            for &(ci, coeff) in coeffs {
+                if let Some(r) = self.solver.constraint_rows[ci] {
+                    by_row.push((r, coeff));
+                }
+            }
+            var_row_coeffs.push(by_row);
+        }
+        let mut constraints: Vec<(CsVec, ComparisonOp, f64)> =
+            Vec::with_capacity(update.new_constraints.len());
+        for (expr, cmp_op, rhs) in update.new_constraints {
+            let coeffs = CsVec::new_from_unsorted(new_num_vars, expr.vars, expr.coeffs)
+                .map_err(|v| Error::InternalError(v.2.to_string()))?;
+            constraints.push((coeffs, cmp_op, rhs));
+        }
+
+        let stop_reason =
+            self.solver
+                .apply_update(&update.new_vars, &var_row_coeffs, constraints)?;
+        self.num_vars = new_num_vars;
+        self.stop_reason = stop_reason;
+        Ok(self)
+    }
+
+    /// Add a new variable (column) to the problem and return the re-optimized solution
+    /// together with the new variable's handle. A convenience wrapper for a one-variable
+    /// [`Update`]; see [`update`](#method.update) / [`apply`](#method.apply) — and
+    /// prefer one batched `Update` when adding several things at once.
+    ///
+    /// This method will consume the solution and not return it in case of error.
+    ///
+    /// # Errors
+    ///
+    /// Will return an error if the variable's bounds are inconsistent or in case of
+    /// numerical problems.
+    pub fn add_var(
+        self,
+        obj_coeff: f64,
+        (min, max): (f64, f64),
+        coeffs: &[(usize, f64)],
+    ) -> Result<(Self, Variable), Error> {
+        let mut update = self.update();
+        let var = update.add_var(obj_coeff, (min, max), coeffs);
+        Ok((self.apply(update)?, var))
     }
 
     /// Add another constraint and return the solution to the updated problem.

@@ -808,6 +808,237 @@ impl Solver {
         Ok(StopReason::Finished)
     }
 
+    /// Apply a batch of new variables (columns) and new constraints
+    /// (rows) to an already-solved problem, then re-optimize warmly
+    /// from the current basis.
+    ///
+    /// The whole batch pays ONE matrix rebuild and at most ONE basis
+    /// refactorization (none at all for a column-only batch applied to
+    /// a freshly-factorized basis): new variables enter NONBASIC at a
+    /// bound chosen like `try_new`'s initial values, so the stored
+    /// basis stays valid; new rows enter with their slack basic, like
+    /// `add_constraint`. If nothing improves and nothing is violated,
+    /// the re-solve is two pricing passes and zero pivots.
+    ///
+    /// `new_var_row_coeffs` gives each new variable's coefficients on
+    /// EXISTING matrix rows; `new_constraints` are over the USER
+    /// variable id space (existing ids plus the new ids
+    /// `num_vars..num_vars+k` in batch order) and may freely reference
+    /// the new variables.
+    pub(crate) fn apply_update(
+        &mut self,
+        new_vars: &[(f64, (f64, f64))],
+        new_var_row_coeffs: &[Vec<(usize, f64)>],
+        new_constraints: Vec<(CsVec, ComparisonOp, f64)>,
+    ) -> Result<StopReason, Error> {
+        assert!(self.is_primal_feasible);
+        assert!(self.is_dual_feasible);
+        assert_eq!(new_vars.len(), new_var_row_coeffs.len());
+
+        let k = new_vars.len();
+        let old_num_vars = self.num_vars;
+        let old_rows = self.num_constraints();
+
+        for &(_, (min, max)) in new_vars {
+            if min > max {
+                return Err(Error::Infeasible);
+            }
+        }
+
+        // Pre-scan new constraints: tautologies (empty left-hand side,
+        // trivially true) occupy no matrix row, exactly as in
+        // `add_constraint`; a trivially FALSE one is infeasible.
+        let mut real_rows: Vec<(CsVec, ComparisonOp, f64)> = Vec::new();
+        let mut row_slots: Vec<Option<usize>> = Vec::with_capacity(new_constraints.len());
+        for (coeffs, cmp_op, rhs) in new_constraints {
+            if coeffs.indices().is_empty() {
+                let is_tautological = match cmp_op {
+                    ComparisonOp::Eq => float_eq(rhs, 0.0),
+                    ComparisonOp::Le => 0.0 <= rhs,
+                    ComparisonOp::Ge => 0.0 >= rhs,
+                };
+                if is_tautological {
+                    row_slots.push(None);
+                    continue;
+                }
+                return Err(Error::Infeasible);
+            }
+            row_slots.push(Some(old_rows + real_rows.len()));
+            real_rows.push((coeffs, cmp_op, rhs));
+        }
+        let m_new = real_rows.len();
+        if k == 0 && m_new == 0 {
+            self.constraint_rows.extend(row_slots);
+            return Ok(StopReason::Finished);
+        }
+
+        // Per-var arrays are indexed by total var id with user vars
+        // first and one slack per row after: the new user vars take ids
+        // `old_num_vars..old_num_vars+k`, so every slack id shifts up
+        // by k.
+        for v in self.basic_vars.iter_mut() {
+            if *v >= old_num_vars {
+                *v += k;
+            }
+        }
+        for v in self.nb_vars.iter_mut() {
+            if *v >= old_num_vars {
+                *v += k;
+            }
+        }
+        let mut any_nonzero_init = false;
+        for (i, &(obj_coeff, (min, max))) in new_vars.iter().enumerate() {
+            let new_var = old_num_vars + i;
+            self.orig_obj_coeffs.insert(new_var, obj_coeff);
+            self.orig_var_mins.insert(new_var, min);
+            self.orig_var_maxs.insert(new_var, max);
+            self.orig_var_domains.insert(new_var, VarDomain::Real);
+
+            // Start value chosen like `try_new`: prefer the bound that
+            // keeps the objective coefficient dual-feasible; a column
+            // that can improve gets pivoted in by `optimize` below.
+            let init_val = if float_eq(min, max) {
+                min
+            } else if min.is_infinite() && max.is_infinite() {
+                0.0
+            } else if obj_coeff > 0.0 {
+                if min.is_finite() {
+                    min
+                } else {
+                    max
+                }
+            } else if obj_coeff < 0.0 {
+                if max.is_finite() {
+                    max
+                } else {
+                    min
+                }
+            } else if min.is_finite() {
+                min
+            } else {
+                max
+            };
+            any_nonzero_init |= init_val != 0.0;
+            self.var_states
+                .insert(new_var, VarState::NonBasic(self.nb_vars.len()));
+            self.nb_vars.push(new_var);
+            self.nb_var_vals.push(init_val);
+            self.nb_var_states.push(NonBasicVarState {
+                at_min: float_eq(init_val, min),
+                at_max: float_eq(init_val, max),
+            });
+            self.nb_var_is_fixed.push(false);
+            if self.enable_primal_steepest_edge {
+                self.sq_norms_update_helper.push(0.0);
+            }
+        }
+        self.num_vars += k;
+
+        // New-var coefficients on existing rows, gathered per row for
+        // the splice below.
+        let mut extra: Vec<Vec<(usize, f64)>> = vec![Vec::new(); old_rows];
+        for (i, coeffs) in new_var_row_coeffs.iter().enumerate() {
+            for &(r, coeff) in coeffs {
+                assert!(r < old_rows, "coefficient on nonexistent row {r}");
+                extra[r].push((old_num_vars + i, coeff));
+            }
+        }
+
+        // ONE matrix rebuild for the whole batch (`add_constraint`
+        // pays this same O(nnz) rebuild for every single row).
+        let new_total = self.num_total_vars() + m_new;
+        let mut mat = CsMat::empty(CompressedStorage::CSR, new_total);
+        for (r, row) in self.orig_constraints.outer_iterator().enumerate() {
+            let mut entries: Vec<(usize, f64)> = row
+                .iter()
+                .map(|(c, &v)| (if c >= old_num_vars { c + k } else { c }, v))
+                .collect();
+            entries.extend(extra[r].iter().copied());
+            entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+            for w in entries.windows(2) {
+                assert!(w[0].0 != w[1].0, "duplicate coefficient on row {r}");
+            }
+            let mut sv = SparseVec::new();
+            for (c, v) in entries {
+                sv.push(c, v);
+            }
+            mat = mat.append_outer_csvec(sv.into_csvec(new_total).view());
+        }
+        for (j, (coeffs, cmp_op, rhs)) in real_rows.into_iter().enumerate() {
+            let slack_var = self.num_vars + old_rows + j;
+            let (slack_min, slack_max) = match cmp_op {
+                ComparisonOp::Le => (0.0, f64::INFINITY),
+                ComparisonOp::Ge => (f64::NEG_INFINITY, 0.0),
+                ComparisonOp::Eq => (0.0, 0.0),
+            };
+            self.orig_obj_coeffs.push(0.0);
+            self.orig_var_mins.push(slack_min);
+            self.orig_var_maxs.push(slack_max);
+            self.orig_var_domains.push(VarDomain::Real);
+            self.var_states.push(VarState::Basic(self.basic_vars.len()));
+            self.basic_vars.push(slack_var);
+            self.basic_var_mins.push(slack_min);
+            self.basic_var_maxs.push(slack_max);
+
+            let mut lhs_val = 0.0;
+            for (var, &coeff) in coeffs.iter() {
+                assert!(var < self.num_vars, "constraint references unknown var {var}");
+                lhs_val += *self.get_value(var) * coeff;
+            }
+            self.basic_var_vals.push(rhs - lhs_val);
+            self.orig_rhs.push(rhs);
+
+            let mut sv = SparseVec::new();
+            for (var, &coeff) in coeffs.iter() {
+                sv.push(var, coeff);
+            }
+            sv.push(slack_var, 1.0);
+            mat = mat.append_outer_csvec(sv.into_csvec(new_total).view());
+        }
+        self.constraint_rows.extend(row_slots);
+        self.orig_constraints = mat;
+        self.orig_constraints_csc = self.orig_constraints.to_csc();
+
+        // At most ONE refactorization per batch — and NONE for a
+        // column-only batch on a clean factorization: new nonbasic
+        // columns leave the basis matrix untouched, so the stored LU
+        // factors remain valid unless eta updates have accumulated.
+        if m_new > 0 || self.basis_solver.eta_matrices.len() > 0 {
+            self.basis_solver
+                .reset(&self.orig_constraints_csc, &self.basic_vars)?;
+        }
+
+        if any_nonzero_init {
+            // Columns starting at a nonzero bound shift the basic
+            // values (b = B⁻¹(rhs − N·x_N)).
+            self.recalc_basic_var_vals()?;
+        }
+        self.recalc_obj_coeffs()?;
+        if self.enable_primal_steepest_edge {
+            self.recalc_primal_sq_norms();
+        }
+        if self.enable_dual_steepest_edge {
+            // Per-row ‖B⁻¹eᵣ‖² for the new rows only; existing rows'
+            // norms survive (their basis rows are unchanged when no
+            // pivot has happened yet).
+            for r in old_rows..self.num_constraints() {
+                self.calc_row_coeffs(r);
+                self.dual_edge_sq_norms
+                    .push(self.inv_basis_row_coeffs.sq_norm());
+            }
+        }
+
+        let (n_primal_infeasible, _) = self.calc_primal_infeasibility();
+        if n_primal_infeasible > 0 {
+            self.is_primal_feasible = false;
+            let stop = self.restore_feasibility()?;
+            if stop == StopReason::Limit {
+                return Ok(stop);
+            }
+        }
+        self.optimize()
+    }
+
     pub(crate) fn add_constraint(
         &mut self,
         mut coeffs: CsVec,
