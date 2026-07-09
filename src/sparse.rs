@@ -102,6 +102,14 @@ impl ScatteredVec {
         self.is_nonzero.resize(n, false);
     }
 
+    /// Grow the dimension PRESERVING current contents (new components
+    /// are zero).
+    pub fn grow(&mut self, n: usize) {
+        debug_assert!(n >= self.values.len());
+        self.values.resize(n, 0.0);
+        self.is_nonzero.resize(n, false);
+    }
+
     pub fn set<'a, T>(&mut self, rhs: T)
     where
         T: IntoIterator<Item = (usize, &'a f64)>,
@@ -174,6 +182,13 @@ impl SparseMat {
         self.indices.clear();
         self.indptr.clear();
         self.indptr.push(0);
+        self.n_rows = n_rows;
+    }
+
+    /// Grow the row dimension PRESERVING the stored columns: existing
+    /// row indices stay valid, the new rows are implicit zeros.
+    pub(crate) fn grow_rows(&mut self, n_rows: usize) {
+        debug_assert!(n_rows >= self.n_rows);
         self.n_rows = n_rows;
     }
 

@@ -410,6 +410,7 @@ impl Solver {
                 scratch,
                 eta_matrices: EtaMatrices::new(num_constraints),
                 rhs: ScatteredVec::empty(num_constraints),
+                lu_dim: num_constraints,
             },
             basic_vars,
             basic_var_vals,
@@ -935,7 +936,9 @@ impl Solver {
         self.num_vars += k;
 
         // New-var coefficients on existing rows, gathered per row for
-        // the splice below.
+        // the splice below. Built in ascending var order per row, so
+        // each list is sorted; a duplicate (same var twice on one row)
+        // shows up as adjacent equal ids.
         let mut extra: Vec<Vec<(usize, f64)>> = vec![Vec::new(); old_rows];
         for (i, coeffs) in new_var_row_coeffs.iter().enumerate() {
             for &(r, coeff) in coeffs {
@@ -943,28 +946,76 @@ impl Solver {
                 extra[r].push((old_num_vars + i, coeff));
             }
         }
-
-        // ONE matrix rebuild for the whole batch (`add_constraint`
-        // pays this same O(nnz) rebuild for every single row).
-        let new_total = self.num_total_vars() + m_new;
-        let mut mat = CsMat::empty(CompressedStorage::CSR, new_total);
-        for (r, row) in self.orig_constraints.outer_iterator().enumerate() {
-            let mut entries: Vec<(usize, f64)> = row
-                .iter()
-                .map(|(c, &v)| (if c >= old_num_vars { c + k } else { c }, v))
-                .collect();
-            entries.extend(extra[r].iter().copied());
-            entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-            for w in entries.windows(2) {
+        for (r, ex) in extra.iter().enumerate() {
+            for w in ex.windows(2) {
                 assert!(w[0].0 != w[1].0, "duplicate coefficient on row {r}");
             }
-            let mut sv = SparseVec::new();
-            for (c, v) in entries {
-                sv.push(c, v);
-            }
-            mat = mat.append_outer_csvec(sv.into_csvec(new_total).view());
         }
-        for (j, (coeffs, cmp_op, rhs)) in real_rows.into_iter().enumerate() {
+
+        // The C-block scan: does any new row place a coefficient on an
+        // OLD variable that is currently BASIC? Coefficients on the
+        // batch's new columns and on old NONBASIC variables live in N;
+        // only old-BASIC entries land in the border block C of the
+        // grown basis [[B, 0], [C, I]]. With C = 0 the basis is block-
+        // DIAGONAL and the retained factorization stays exactly valid.
+        let mut c_nonzero = false;
+        'scan: for (coeffs, _, _) in &real_rows {
+            for (var, _) in coeffs.iter() {
+                if var < old_num_vars {
+                    if let VarState::Basic(_) = self.var_states[var] {
+                        c_nonzero = true;
+                        break 'scan;
+                    }
+                }
+            }
+        }
+
+        // ---- ONE linear repack per representation for the whole batch --
+        // (`add_constraint` pays an allocate-and-rebuild per row; here
+        // both matrices are rebuilt in single exact-size passes — raw
+        // slice bulk copies, no per-row allocations, no sorting, no
+        // per-entry sprs views.)
+        let new_total = self.num_total_vars() + m_new;
+        let n_rows_total = old_rows + m_new;
+        let extra_nnz: usize = extra.iter().map(|e| e.len()).sum();
+        let new_rows_nnz: usize =
+            real_rows.iter().map(|(c, _, _)| c.indices().len() + 1).sum();
+        let nnz_total = self.orig_constraints.nnz() + extra_nnz + new_rows_nnz;
+
+        // CSR: per row — old entries below the user/slack boundary keep
+        // their ids, the batch's new columns splice at the boundary,
+        // old entries at/above it shift by k. All three runs are
+        // ascending, so the result stays sorted without a sort.
+        let old_ip: Vec<usize> = self.orig_constraints.indptr().to_proper().to_vec();
+        let old_ix = self.orig_constraints.indices();
+        let old_dt = self.orig_constraints.data();
+        let mut indptr = Vec::with_capacity(n_rows_total + 1);
+        let mut indices = Vec::with_capacity(nnz_total);
+        let mut data = Vec::with_capacity(nnz_total);
+        indptr.push(0);
+        for r in 0..old_rows {
+            let (lo, hi) = (old_ip[r], old_ip[r + 1]);
+            let row_ix = &old_ix[lo..hi];
+            let row_dt = &old_dt[lo..hi];
+            let split = row_ix.partition_point(|&c| c < old_num_vars);
+            indices.extend_from_slice(&row_ix[..split]);
+            data.extend_from_slice(&row_dt[..split]);
+            for &(c, v) in &extra[r] {
+                indices.push(c);
+                data.push(v);
+            }
+            indices.extend(row_ix[split..].iter().map(|&c| c + k));
+            data.extend_from_slice(&row_dt[split..]);
+            indptr.push(indices.len());
+        }
+
+        // New rows: slack bookkeeping + entries (user ids are final;
+        // the fresh slack id is the largest, keeping the row sorted).
+        // Also gather each row's entries per COLUMN for the CSC pass —
+        // new rows carry the largest row ids, so appending them to a
+        // column keeps it sorted.
+        let mut col_new: Vec<Vec<(usize, f64)>> = vec![Vec::new(); self.num_vars];
+        for (j, (coeffs, cmp_op, rhs)) in real_rows.iter().enumerate() {
             let slack_var = self.num_vars + old_rows + j;
             let (slack_min, slack_max) = match cmp_op {
                 ComparisonOp::Le => (0.0, f64::INFINITY),
@@ -984,47 +1035,154 @@ impl Solver {
             for (var, &coeff) in coeffs.iter() {
                 assert!(var < self.num_vars, "constraint references unknown var {var}");
                 lhs_val += *self.get_value(var) * coeff;
+                col_new[var].push((old_rows + j, coeff));
+                indices.push(var);
+                data.push(coeff);
             }
-            self.basic_var_vals.push(rhs - lhs_val);
-            self.orig_rhs.push(rhs);
-
-            let mut sv = SparseVec::new();
-            for (var, &coeff) in coeffs.iter() {
-                sv.push(var, coeff);
-            }
-            sv.push(slack_var, 1.0);
-            mat = mat.append_outer_csvec(sv.into_csvec(new_total).view());
+            self.basic_var_vals.push(*rhs - lhs_val);
+            self.orig_rhs.push(*rhs);
+            indices.push(slack_var);
+            data.push(1.0);
+            indptr.push(indices.len());
         }
-        self.constraint_rows.extend(row_slots);
-        self.orig_constraints = mat;
-        self.orig_constraints_csc = self.orig_constraints.to_csc();
+        let csr = CsMat::new((n_rows_total, new_total), indptr, indices, data);
 
-        // At most ONE refactorization per batch — and NONE for a
-        // column-only batch on a clean factorization: new nonbasic
-        // columns leave the basis matrix untouched, so the stored LU
-        // factors remain valid unless eta updates have accumulated.
-        if m_new > 0 || self.basis_solver.eta_matrices.len() > 0 {
+        // CSC: columns in the new order are [old users | new users |
+        // old slacks | new slacks]. Old columns copy their slices (row
+        // ids never shift) plus any appended new-row entries; new user
+        // columns come from their given row coefficients; the old-slack
+        // region is ONE contiguous block copy; new slacks are unit.
+        let csc_ip: Vec<usize> =
+            self.orig_constraints_csc.indptr().to_proper().to_vec();
+        let csc_ix = self.orig_constraints_csc.indices();
+        let csc_dt = self.orig_constraints_csc.data();
+        let mut col_ptrs = Vec::with_capacity(new_total + 1);
+        let mut row_ids = Vec::with_capacity(nnz_total);
+        let mut vals = Vec::with_capacity(nnz_total);
+        col_ptrs.push(0);
+        for c in 0..old_num_vars {
+            let (lo, hi) = (csc_ip[c], csc_ip[c + 1]);
+            row_ids.extend_from_slice(&csc_ix[lo..hi]);
+            vals.extend_from_slice(&csc_dt[lo..hi]);
+            for &(r, v) in &col_new[c] {
+                row_ids.push(r);
+                vals.push(v);
+            }
+            col_ptrs.push(row_ids.len());
+        }
+        for i in 0..k {
+            let c = old_num_vars + i;
+            let mut ex: Vec<(usize, f64)> = new_var_row_coeffs[i].clone();
+            ex.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+            for (r, v) in ex {
+                row_ids.push(r);
+                vals.push(v);
+            }
+            for &(r, v) in &col_new[c] {
+                row_ids.push(r);
+                vals.push(v);
+            }
+            col_ptrs.push(row_ids.len());
+        }
+        {
+            let block_lo = csc_ip[old_num_vars];
+            row_ids.extend_from_slice(&csc_ix[block_lo..]);
+            vals.extend_from_slice(&csc_dt[block_lo..]);
+            for c in old_num_vars..old_num_vars + old_rows {
+                let filled = col_ptrs[old_num_vars + k] + (csc_ip[c + 1] - block_lo);
+                col_ptrs.push(filled);
+            }
+        }
+        for j in 0..m_new {
+            row_ids.push(old_rows + j);
+            vals.push(1.0);
+            col_ptrs.push(row_ids.len());
+        }
+        let csc = CsMat::new_csc((n_rows_total, new_total), col_ptrs, row_ids, vals);
+
+        self.constraint_rows.extend(row_slots);
+        self.orig_constraints = csr;
+        self.orig_constraints_csc = csc;
+
+        // ---- factorization: the C=0 fast path -------------------------
+        // With no border block (C = 0), no nonzero starting values, and
+        // no primal steepest-edge state to maintain, appended rows form
+        // an identity border on the retained factorization: grow the
+        // buffers and keep the LU + eta sequence VERBATIM — zero new
+        // floating-point operations. Otherwise fall back to the exact
+        // refactorization.
+        let fast = !c_nonzero && !any_nonzero_init && !self.enable_primal_steepest_edge;
+        if fast {
+            if m_new > 0 {
+                self.basis_solver.grow_identity(self.num_constraints());
+            }
+        } else if m_new > 0 {
+            debug!(
+                "apply_update slow path: C nonzero = {}, nonzero init = {}",
+                c_nonzero, any_nonzero_init
+            );
             self.basis_solver
                 .reset(&self.orig_constraints_csc, &self.basic_vars)?;
         }
 
-        if any_nonzero_init {
-            // Columns starting at a nonzero bound shift the basic
-            // values (b = B⁻¹(rhs − N·x_N)).
-            self.recalc_basic_var_vals()?;
-        }
-        self.recalc_obj_coeffs()?;
-        if self.enable_primal_steepest_edge {
-            self.recalc_primal_sq_norms();
+        if fast {
+            // Incremental pricing: the appended slacks are basic with
+            // zero objective, so the duals of existing rows — and hence
+            // every existing reduced cost — are UNCHANGED. One
+            // eta-aware transposed solve prices just the new columns
+            // (none needed for a rows-only batch); cur_obj_val is
+            // unchanged (new nonbasic vars start at 0, new basic slacks
+            // carry zero objective).
+            if k > 0 {
+                let c_b: Vec<(usize, f64)> = self
+                    .basic_vars
+                    .iter()
+                    .enumerate()
+                    .filter(|&(_, &v)| self.orig_obj_coeffs[v] != 0.0)
+                    .map(|(r, &v)| (r, self.orig_obj_coeffs[v]))
+                    .collect();
+                let y: Vec<f64> = self
+                    .basis_solver
+                    .solve_transp(c_b.iter().map(|(r, c)| (*r, c)))
+                    .values
+                    .clone();
+                for i in 0..k {
+                    let var = old_num_vars + i;
+                    let col =
+                        self.orig_constraints_csc.outer_view(var).expect("new column");
+                    let dot: f64 = col.iter().map(|(r, &v)| v * y[r]).sum();
+                    self.nb_var_obj_coeffs
+                        .push(self.orig_obj_coeffs[var] - dot);
+                }
+            }
+        } else {
+            if any_nonzero_init {
+                // Columns starting at a nonzero bound shift the basic
+                // values (b = B⁻¹(rhs − N·x_N)).
+                self.recalc_basic_var_vals()?;
+            }
+            self.recalc_obj_coeffs()?;
+            if self.enable_primal_steepest_edge {
+                self.recalc_primal_sq_norms();
+            }
         }
         if self.enable_dual_steepest_edge {
-            // Per-row ‖B⁻¹eᵣ‖² for the new rows only; existing rows'
-            // norms survive (their basis rows are unchanged when no
-            // pivot has happened yet).
-            for r in old_rows..self.num_constraints() {
-                self.calc_row_coeffs(r);
-                self.dual_edge_sq_norms
-                    .push(self.inv_basis_row_coeffs.sq_norm());
+            if fast {
+                // Border rows: B⁻¹eᵣ = eᵣ exactly (identity block; the
+                // pre-existing etas cannot touch rows that did not
+                // exist when they were created), so ‖B⁻¹eᵣ‖² = 1.
+                for _ in old_rows..self.num_constraints() {
+                    self.dual_edge_sq_norms.push(1.0);
+                }
+            } else {
+                // Per-row ‖B⁻¹eᵣ‖² for the new rows only; existing
+                // rows' norms survive (their basis rows are unchanged
+                // when no pivot has happened yet).
+                for r in old_rows..self.num_constraints() {
+                    self.calc_row_coeffs(r);
+                    self.dual_edge_sq_norms
+                        .push(self.inv_basis_row_coeffs.sq_norm());
+                }
             }
         }
 
@@ -1036,7 +1194,32 @@ impl Solver {
                 return Ok(stop);
             }
         }
-        self.optimize()
+        let stop = self.optimize()?;
+        #[cfg(debug_assertions)]
+        if stop == StopReason::Finished {
+            self.debug_check_basic_residual();
+        }
+        Ok(stop)
+    }
+
+    /// The warm-apply residual gate: every constraint row must hold
+    /// exactly under the current variable values (rows carry their
+    /// slack, so each is an equality). Catches any desynchronization
+    /// between the repacked matrices, the border solves, and the
+    /// incremental pricing.
+    #[cfg(debug_assertions)]
+    fn debug_check_basic_residual(&self) {
+        for (r, row) in self.orig_constraints.outer_iterator().enumerate() {
+            let mut lhs = 0.0;
+            for (c, &v) in row.iter() {
+                lhs += v * *self.get_value(c);
+            }
+            let resid = (lhs - self.orig_rhs[r]).abs();
+            assert!(
+                resid <= 1e-7 * (1.0 + self.orig_rhs[r].abs()),
+                "warm apply residual {resid:.3e} on row {r}"
+            );
+        }
     }
 
     pub(crate) fn add_constraint(
@@ -1692,7 +1875,7 @@ impl Solver {
             }
         }
 
-        if self.basis_solver.eta_matrices.len() > 0 {
+        if self.basis_solver.eta_matrices.len() > 0 || self.basis_solver.border() > 0 {
             self.basis_solver
                 .reset(&self.orig_constraints_csc, &self.basic_vars)?;
         }
@@ -1705,7 +1888,9 @@ impl Solver {
     }
 
     fn recalc_obj_coeffs(&mut self) -> Result<(), Error> {
-        if self.basis_solver.eta_matrices.len() > 0 {
+        // The dense LU solves below bypass the eta chain AND the
+        // identity border — collapse both into a fresh factorization.
+        if self.basis_solver.eta_matrices.len() > 0 || self.basis_solver.border() > 0 {
             self.basis_solver
                 .reset(&self.orig_constraints_csc, &self.basic_vars)?;
         }
@@ -1779,6 +1964,17 @@ struct BasisSolver {
     scratch: ScratchSpace,
     eta_matrices: EtaMatrices,
     rhs: ScatteredVec,
+    /// Dimension of the current LU factorization. Rows with ids ≥ this
+    /// form the identity BORDER: appended after the last
+    /// refactorization with their slack basic and no coefficients on
+    /// any old basic column (the C=0 condition checked by
+    /// `apply_update`), so the basis is block-diagonal
+    /// `[[B_lu, 0], [0, I]]` — the LU factors and the accumulated eta
+    /// sequence stay valid VERBATIM, and both solve directions pass
+    /// border components through untouched. Etas pushed after a border
+    /// exists may reference border rows freely (the eta machinery is
+    /// dimension-agnostic once the buffers are grown).
+    lu_dim: usize,
 }
 
 impl BasisSolver {
@@ -1794,10 +1990,25 @@ impl BasisSolver {
         self.eta_matrices.push(r_leaving, coeffs);
     }
 
+    /// Grow the row dimension by an identity border (basic slacks, no
+    /// coefficients on old basic columns): the buffers extend, the LU
+    /// factorization and the eta sequence are untouched and stay
+    /// exactly valid.
+    fn grow_identity(&mut self, n_rows: usize) {
+        self.eta_matrices.coeff_cols.grow_rows(n_rows);
+        self.rhs.grow(n_rows);
+    }
+
+    /// Rows beyond the factorized dimension (0 when fully factorized).
+    fn border(&self) -> usize {
+        self.rhs.len().saturating_sub(self.lu_dim)
+    }
+
     fn reset(&mut self, orig_constraints_csc: &CsMat, basic_vars: &[usize]) -> Result<(), Error> {
         self.scratch.clear_sparse(basic_vars.len());
         self.eta_matrices.clear_and_resize(basic_vars.len());
         self.rhs.clear_and_resize(basic_vars.len());
+        self.lu_dim = basic_vars.len();
         self.lu_factors = lu_factorize(
             basic_vars.len(),
             |c| {
@@ -1815,8 +2026,18 @@ impl BasisSolver {
     }
 
     fn solve<'a>(&mut self, rhs: impl Iterator<Item = (usize, &'a f64)>) -> &ScatteredVec {
+        let full_dim = self.rhs.len();
         self.rhs.set(rhs);
+        // With a border, the basis is [[B_lu, 0], [0, I]] followed by
+        // the etas: the LU block must only see components below
+        // `lu_dim`; border components pass through untouched (identity)
+        // and rejoin for the full-dimension eta applications.
+        let held = self.hold_border_components();
         self.lu_factors.solve(&mut self.rhs, &mut self.scratch);
+        self.rhs.grow(full_dim);
+        for (i, v) in held {
+            *self.rhs.get_mut(i) = v;
+        }
 
         // apply eta matrices (Vanderbei p.139)
         for idx in 0..self.eta_matrices.len() {
@@ -1832,6 +2053,7 @@ impl BasisSolver {
 
     /// Pass right-hand side via self.rhs
     fn solve_transp<'a>(&mut self, rhs: impl Iterator<Item = (usize, &'a f64)>) -> &ScatteredVec {
+        let full_dim = self.rhs.len();
         self.rhs.set(rhs);
         // apply eta matrices in reverse (Vanderbei p.139)
         for idx in (0..self.eta_matrices.len()).rev() {
@@ -1844,9 +2066,40 @@ impl BasisSolver {
             *self.rhs.get_mut(r_leaving) -= coeff;
         }
 
+        // The transposed border block is also the identity: border
+        // components pass through the LU-transposed solve untouched.
+        let held = self.hold_border_components();
         self.lu_factors_transp
             .solve(&mut self.rhs, &mut self.scratch);
+        self.rhs.grow(full_dim);
+        for (i, v) in held {
+            *self.rhs.get_mut(i) = v;
+        }
         &mut self.rhs
+    }
+
+    /// Detach the border components of `self.rhs` (ids ≥ `lu_dim`) so
+    /// the LU routines — whose permutations are indexed by the
+    /// factorized dimension — never see them. Returns the held
+    /// (id, value) pairs.
+    fn hold_border_components(&mut self) -> Vec<(usize, f64)> {
+        if self.border() == 0 {
+            return Vec::new();
+        }
+        let mut held = Vec::new();
+        let mut i = 0;
+        while i < self.rhs.nonzero.len() {
+            let idx = self.rhs.nonzero[i];
+            if idx >= self.lu_dim {
+                held.push((idx, self.rhs.values[idx]));
+                self.rhs.values[idx] = 0.0;
+                self.rhs.is_nonzero[idx] = false;
+                self.rhs.nonzero.swap_remove(i);
+            } else {
+                i += 1;
+            }
+        }
+        held
     }
 }
 

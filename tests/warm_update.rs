@@ -221,6 +221,117 @@ fn warm_apply_matches_cold_rebuild_fuzz() {
     }
 }
 
+/// SEQUENCE fuzz: several batches applied to ONE retained solution
+/// (identity-border growth, pivots, further growth on top of etas —
+/// the drain-loop shape), each step checked against a cold rebuild of
+/// the accumulated problem.
+#[test]
+fn warm_sequences_match_cold_rebuild_fuzz() {
+    for seed in 1000..1150u64 {
+        let mut s = seed;
+        // Accumulated problem as data.
+        let base = random_spec(seed);
+        let mut vars: Vec<(f64, f64, f64)> = base.vars.clone();
+        let mut rows: Vec<(Vec<(usize, f64)>, ComparisonOp, f64)> = base.rows.clone();
+
+        let mut p = Problem::new(OptimizationDirection::Minimize);
+        let vs: Vec<Variable> = vars.iter().map(|&(c, lo, hi)| p.add_var(c, (lo, hi))).collect();
+        for (terms, op, rhs) in &rows {
+            let expr: Vec<(Variable, f64)> = terms.iter().map(|&(v, c)| (vs[v], c)).collect();
+            p.add_constraint(expr, *op, *rhs);
+        }
+        let mut warm = p.solve().expect("base feasible");
+        let mut handles = vs;
+
+        for _round in 0..3 {
+            // Random batch over the CURRENT accumulated problem.
+            let nv = vars.len();
+            let nr = rows.len();
+            let mut u = warm.update();
+            let bk = (lcg(&mut s) % 3) as usize;
+            for _ in 0..bk {
+                let mut coeffs: Vec<(usize, f64)> = Vec::new();
+                for _ in 0..(lcg(&mut s) % 3) {
+                    let r = (lcg(&mut s) % nr as u64) as usize;
+                    if !coeffs.iter().any(|&(cr, _)| cr == r) {
+                        coeffs.push((r, 0.5 + (lcg(&mut s) % 4) as f64 * 0.5));
+                    }
+                }
+                let obj = 0.25 + (lcg(&mut s) % 8) as f64 * 0.25;
+                handles.push(u.add_var(obj, (0.0, 10.0), &coeffs));
+                vars.push((obj, 0.0, 10.0));
+                // record coeffs into the accumulated rows for the cold build
+                for &(r, c) in &coeffs {
+                    rows[r].0.push((vars.len() - 1, c));
+                }
+            }
+            let br = (lcg(&mut s) % 3) as usize;
+            for i in 0..br {
+                let total_v = vars.len();
+                let nt = 2 + (lcg(&mut s) % 3) as usize;
+                let mut terms: Vec<(usize, f64)> = Vec::new();
+                for _ in 0..nt {
+                    let v = (lcg(&mut s) % total_v as u64) as usize;
+                    if !terms.iter().any(|&(tv, _)| tv == v) {
+                        terms.push((v, 0.5 + (lcg(&mut s) % 5) as f64 * 0.5));
+                    }
+                }
+                let (op, rhs) = if i % 2 == 0 {
+                    (ComparisonOp::Ge, 0.5 + (lcg(&mut s) % 2) as f64)
+                } else {
+                    (ComparisonOp::Le, 25.0 + (lcg(&mut s) % 10) as f64)
+                };
+                let expr: Vec<(Variable, f64)> =
+                    terms.iter().map(|&(v, c)| (handles[v], c)).collect();
+                u.add_constraint(expr, op, rhs);
+                rows.push((terms, op, rhs));
+            }
+            warm = warm.apply(u).expect("batch keeps the LP feasible");
+
+            // Cold rebuild of the accumulated problem.
+            let mut p2 = Problem::new(OptimizationDirection::Minimize);
+            let vs2: Vec<Variable> =
+                vars.iter().map(|&(c, lo, hi)| p2.add_var(c, (lo, hi))).collect();
+            for (terms, op, rhs) in &rows {
+                let expr: Vec<(Variable, f64)> =
+                    terms.iter().map(|&(v, c)| (vs2[v], c)).collect();
+                p2.add_constraint(expr, *op, *rhs);
+            }
+            let cold = p2.solve().expect("cold rebuild feasible");
+            let (w, c) = (warm.objective(), cold.objective());
+            assert!(
+                (w - c).abs() <= 1e-6 + 1e-9 * c.abs(),
+                "seed {seed}: warm {w} vs cold {c}"
+            );
+        }
+    }
+}
+
+/// The C≠0 fallback: a new row referencing an old BASIC variable makes
+/// the border block nonzero — the fast path must refuse and the
+/// refactorizing fallback must still land on the cold optimum.
+#[test]
+fn c_nonzero_row_falls_back_and_matches_cold() {
+    // min x + 2y  s.t.  x + y ≥ 2 → x = 2 (x is BASIC at the optimum).
+    let mut p = Problem::new(OptimizationDirection::Minimize);
+    let x = p.add_var(1.0, (0.0, f64::INFINITY));
+    let y = p.add_var(2.0, (0.0, f64::INFINITY));
+    p.add_constraint([(x, 1.0), (y, 1.0)], ComparisonOp::Ge, 2.0);
+    let sol = p.solve().unwrap();
+    assert!((sol[x] - 2.0).abs() < 1e-9, "x is basic at 2");
+
+    // New row caps the BASIC x at 1.5: C ≠ 0, and the row is violated
+    // at the current point — the fallback must refactorize, restore
+    // feasibility, and re-optimize.
+    let mut u = sol.update();
+    u.add_constraint([(x, 1.0)], ComparisonOp::Le, 1.5);
+    let warm = sol.apply(u).unwrap();
+    // Cold: x = 1.5, y = 0.5 → obj 1.5 + 1.0 = 2.5.
+    assert!((warm.objective() - 2.5).abs() < 1e-9, "obj {}", warm.objective());
+    assert!((warm[x] - 1.5).abs() < 1e-9);
+    assert!((warm[y] - 0.5).abs() < 1e-9);
+}
+
 /// Transportation-shaped LP at roughly the flow-LP scale.
 fn build_transportation(
     m: usize,
@@ -259,6 +370,45 @@ fn build_transportation(
         p.add_constraint(terms, ComparisonOp::Ge, 1.0);
     }
     (p, arcs)
+}
+
+/// Steady-state warm-apply cost: many sequential batches on one
+/// retained solution (the incremental caller's real shape), reported
+/// as an average.
+#[test]
+fn warm_apply_steady_state_cost() {
+    let m = 60usize;
+    let n = 950usize;
+    let (p, _) = build_transportation(m, n, &[]);
+    let mut sol = p.solve().unwrap();
+
+    // Columns-only steady state (non-improving: zero pivots).
+    let t0 = Instant::now();
+    let rounds_cols = 50;
+    for i in 0..rounds_cols {
+        let mut u = sol.update();
+        u.add_var(50.0 + i as f64, (0.0, f64::INFINITY), &[(i % m, 1.0), (m + i % n, 1.0)]);
+        sol = sol.apply(u).unwrap();
+    }
+    let cols_us = t0.elapsed().as_secs_f64() * 1e6 / rounds_cols as f64;
+
+    // Mixed steady state: a column + a row per batch (C=0: the new row
+    // references only the new column).
+    let t1 = Instant::now();
+    let rounds_mixed = 50;
+    for i in 0..rounds_mixed {
+        let mut u = sol.update();
+        let v = u.add_var(60.0 + i as f64, (0.0, f64::INFINITY), &[(i % m, 1.0)]);
+        u.add_constraint([(v, 1.0)], ComparisonOp::Le, 1.0);
+        sol = sol.apply(u).unwrap();
+    }
+    let mixed_us = t1.elapsed().as_secs_f64() * 1e6 / rounds_mixed as f64;
+
+    // An improving column at the end still lands on the right optimum.
+    let (sol, good) = sol.add_var(0.01, (0.0, f64::INFINITY), &[(0, 1.0), (m + 3, 1.0)]).unwrap();
+    assert!(sol[good] > 0.5);
+
+    println!("steady-state warm apply: cols-only {cols_us:.1}µs | mixed (col+row) {mixed_us:.1}µs");
 }
 
 #[test]
